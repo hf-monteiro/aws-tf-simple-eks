@@ -1,43 +1,108 @@
-# AWS-Simple-EKS
+# AWS Simple EKS Environment
 
-This repository contains the infrastructure code to set up an Elastic Kubernetes Service (EKS) cluster on AWS using Terraform. The structure is organized to modularize components of the EKS cluster, its related resources, and configurations.
+Terraform configuration for a production-oriented EKS environment on AWS. Includes VPC with private networking, EKS cluster with OIDC, Karpenter auto-scaling, ArgoCD, External Secrets Operator, ECR repositories, EFS persistent storage, Aurora MySQL databases, S3 buckets, and VPC endpoints for private AWS service access.
 
-## Structure
+## Architecture
 
-- **add-ons/**: This directory holds the configurations for additional features or software to be installed on the EKS cluster, such as monitoring tools, logging, or integrations.
-  
-- **argo/**: Contains the declarative configuration files for Argo CD, a continuous deployment tool that enables the automated deployment of applications to Kubernetes.
-  
-- **karpenter/**: Holds the configurations for Karpenter, an open-source auto-scaling project designed for Kubernetes.
+```mermaid
+flowchart TD
+    subgraph VPC["VPC (public + private subnets across 3 AZs)"]
+        subgraph Public["Public Subnets"]
+            IGW["Internet Gateway"]
+            EFS_MT["EFS Mount Targets\n(1a · 1b · 1c)"]
+        end
 
-- **data.tf**: Terraform file defining data sources that the Terraform configuration may use.
+        subgraph Private["Private Subnets"]
+            subgraph EKS["EKS Cluster"]
+                NODES["Worker Nodes\n(Karpenter managed)"]
+                ARGO["ArgoCD\n(GitOps CD)"]
+                EXT_DNS["External DNS"]
+                EXT_SEC["External Secrets\nOperator"]
+            end
+            RDS["Aurora MySQL\n(per service)"]
+        end
 
-- **databases.tf**: Terraform configuration for setting up databases related to the EKS cluster.
+        EP_S3["VPC Endpoint\nS3 (Gateway)"]
+        EP_SM["VPC Endpoint\nSecrets Manager (Interface)"]
+    end
 
-- **dev.tfvars**: Variable definitions for a development environment in Terraform.
+    DEV["Developer / CI"] -- "kubectl / API" --> EKS
+    ARGO -- "pull manifests" --> GIT["Git Repository"]
+    EKS -- "pull images" --> ECR["ECR\nweb-service\nfrontend-api\nbackend-api"]
+    EKS -- "read secrets (IRSA)" --> EP_SM --> SM["Secrets Manager"]
+    EKS -- "object storage" --> EP_S3 --> S3["S3 Buckets\nback-app · front-app"]
+    EKS -- "persistent volumes" --> EFS["EFS\nShared File System"]
+    NODES -- "databases" --> RDS
+    EFS_MT --- EFS
+```
 
-- **ebs-csi-policy.json**: A policy document for the Amazon EBS CSI driver that provides a storage interface to attach EBS as persistent volumes in Kubernetes.
+## Repository Structure
 
-- **ecr.tf**: Terraform configuration for the Elastic Container Registry, where Docker images used in the cluster are stored.
+```
+├── eks.tf              # EKS cluster module + OIDC + IAM roles (sm-role, oid-role, external-secrets)
+├── vpc.tf              # VPC module + S3 VPC endpoint + Secrets Manager VPC endpoint
+├── databases.tf        # Aurora MySQL clusters (one per service) + subnet group + security groups
+├── ecr.tf              # ECR repositories (web-service, frontend-api, backend-api)
+├── efs.tf              # EFS file system + mount targets across 3 AZs
+├── s3.tf               # S3 buckets (back-app, front-app)
+├── data.tf             # Data sources (OIDC policy docs, Secrets Manager)
+├── main.tf             # Terraform backend (S3)
+├── provider.tf         # AWS provider
+├── vars.tf             # Input variables
+├── dev.tfvars          # Dev environment variable values
+├── storageclass.yml    # Kubernetes StorageClass for EFS/EBS
+├── ebs-csi-policy.json # EBS CSI driver IAM policy
+├── add-ons/
+│   └── external-dns.yml     # ExternalDNS Helm values
+├── argo/
+│   ├── argoingress.yml      # ArgoCD ingress
+│   ├── argogrpc.yml         # ArgoCD gRPC config
+│   ├── argoui.yml           # ArgoCD UI config
+│   └── iam_policy.json      # ArgoCD IAM policy
+└── karpenter/
+    └── provisioner.yml      # Karpenter node provisioner
+```
 
-- **efs.tf**: Terraform configuration for setting up the Elastic File System, providing shared file storage for the EKS cluster.
+## Prerequisites
 
-- **eks.tf**: Main Terraform configuration file for creating an EKS cluster.
+- [Terraform](https://learn.hashicorp.com/tutorials/terraform/install-cli) installed
+- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) configured
+- [kubectl](https://kubernetes.io/docs/tasks/tools/) installed
+- S3 bucket for Terraform remote state
+- Secrets Manager secret with database credentials
 
-- **main.tf**: The primary entry point for Terraform configurations, often used to define the provider and initialize the backend.
+## Variables
 
-- **provider.tf**: Defines the Terraform provider(s) and their configurations, such as AWS.
-
-- **s3.tf**: Terraform configuration for setting up S3 buckets, potentially for storage related to the EKS operations.
-
-- **storageclass.yml**: A Kubernetes manifest file that defines storage classes which dictate how storage volumes are dynamically provisioned.
-
-- **vars.tf**: Defines the input variables for the Terraform configurations.
-
-- **vpc.tf**: Terraform configuration for setting up the Virtual Private Cloud (VPC) where the EKS cluster will reside.
+| Variable | Description |
+|----------|-------------|
+| `env` | Deployment environment (e.g. `dev`, `prod`) |
+| `cidr` | VPC CIDR block |
+| `vpc-name` | VPC name |
+| `cluster-name` | EKS cluster name |
+| `k8s` | Kubernetes-specific config passed to VPC module |
+| `mysql-dbs` | Map of MySQL database configurations per service |
 
 ## Usage
 
-To use this repository, ensure that you have Terraform and AWS CLI installed and configured on your machine. You may need to adjust the variable files to match your specific AWS setup.
+```shell
+aws configure
 
-Please refer to the individual Terraform files for detailed resource configurations and adapt them to your infrastructure requirements.
+terraform init -backend-config="bucket=<state-bucket>"
+terraform plan -var-file=dev.tfvars
+terraform apply -var-file=dev.tfvars
+```
+
+After the cluster is up, configure `kubectl`:
+
+```shell
+aws eks update-kubeconfig --name <cluster-name> --region us-east-1
+```
+
+Apply Kubernetes manifests:
+
+```shell
+kubectl apply -f storageclass.yml
+kubectl apply -f argo/
+kubectl apply -f add-ons/
+kubectl apply -f karpenter/
+```
